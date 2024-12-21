@@ -1,0 +1,188 @@
+import os
+import pyaudio
+import wave
+import openai
+import requests
+from bs4 import BeautifulSoup
+from googlesearch import search
+import numpy as np
+from pydub import AudioSegment
+from pydub.playback import play
+from openai import AssistantEventHandler, OpenAI
+import tempfile
+from io import BytesIO
+
+# Audio Configuration
+CHUNK = 1024
+FORMAT = pyaudio.paInt16
+CHANNELS = 1
+RATE = 44100
+SILENCE_THRESHOLD = 1000
+END_SILENCE_DURATION = 2
+
+# API Key and Client Initialization
+openai.api_key = os.getenv("OPENAI_API_KEY")
+client = OpenAI(api_key=openai.api_key)
+
+# Assistant Configuration
+assistant = client.beta.assistants.create(
+    name="KimchiBot",
+    instructions="You are Kimchi, Mr. Lee's personal assistant. If you don't know the answer, search the web and provide a concise general summary. Alyways refer to me as Mr. Lee.",
+    model="gpt-4o"
+)
+assistant_id = assistant.id
+
+# Initialize Audio Stream
+p = pyaudio.PyAudio()
+stream = p.open(format=FORMAT, channels=CHANNELS, rate=RATE, input=True, frames_per_buffer=CHUNK)
+
+
+class EventHandler(AssistantEventHandler):
+    def __init__(self):
+        super().__init__()
+        self.response_text = ""
+
+    def on_text_delta(self, delta, snapshot):
+        self.response_text += getattr(delta, 'value', str(delta))
+
+    def on_message_done(self, message):
+        print(f"\nAssistant Response: {self.response_text}")
+
+
+# Web Scraping Function to Fetch a General Summary
+def fetch_general_summary(url):
+    response = requests.get(url)
+    soup = BeautifulSoup(response.content, 'html.parser')
+
+    # Extract title, description, and brief content for a general summary
+    title = soup.find("title").get_text(strip=True) if soup.find("title") else "No title found"
+    description = soup.find("meta", property="og:description")
+    if not description:
+        description = soup.find("meta", attrs={"name": "description"})
+    description = description["content"] if description else "No description found"
+
+    # Get a brief content snippet
+    paragraphs = soup.find_all("p")
+    content = paragraphs[0].get_text(strip=True) if paragraphs else "No further content available."
+
+    return f"{title}: {description}. {content}"
+
+
+# Perform a Web Search and Retrieve a General Summary
+def search_and_summarize(query):
+    try:
+        # Perform a Google search and get the first URL
+        for url in search(query, num_results=1):
+            return fetch_general_summary(url)
+    except Exception as e:
+        return f"Could not perform web search due to: {e}"
+
+
+# Function to Record Audio Until Silence is Detected
+def transcribe_audio():
+    frames = []
+    silent_chunks = 0
+    is_speaking = False
+    print("Start speaking...")
+
+    while True:
+        data = stream.read(CHUNK)
+        frames.append(data)
+
+        # Detect amplitude to determine silence or speaking
+        audio_data = np.frombuffer(data, dtype=np.int16)
+        amplitude = np.abs(audio_data).mean()
+
+        if amplitude > SILENCE_THRESHOLD:
+            silent_chunks = 0
+            is_speaking = True
+        else:
+            silent_chunks += 1
+
+        if is_speaking and silent_chunks > RATE / CHUNK * END_SILENCE_DURATION:
+            break
+
+    # Save audio as a temporary WAV file for transcription
+    fd, temp_wav_path = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    with wave.open(temp_wav_path, 'wb') as wf:
+        wf.setnchannels(CHANNELS)
+        wf.setsampwidth(p.get_sample_size(FORMAT))
+        wf.setframerate(RATE)
+        wf.writeframes(b''.join(frames))
+
+    # Transcribe the audio file with OpenAI's Whisper model
+    with open(temp_wav_path, 'rb') as audio_file:
+        transcript = client.audio.transcriptions.create(model="whisper-1", file=audio_file)
+
+    os.remove(temp_wav_path)
+    return transcript.text
+
+
+# Convert Assistant's Text Response to Audio and Play
+def text_to_audio(text):
+    response = client.audio.speech.create(model="tts-1", voice="nova", input=text)
+    audio_stream = BytesIO()
+    for chunk in response.iter_bytes():
+        audio_stream.write(chunk)
+    audio_stream.seek(0)
+
+    # Play audio directly from in-memory stream
+    audio_segment = AudioSegment.from_file(audio_stream, format="mp3")
+    play(audio_segment)
+
+
+# Send User's Transcription to Assistant and Get a Response
+def send_message_to_assistant(client, thread_id, content):
+    client.beta.threads.messages.create(
+        thread_id=thread_id,
+        role="user",
+        content=[{"type": "text", "text": content}]
+    )
+
+
+# Stream Assistant Response and Retrieve Final Text
+def run_assistant(client, thread_id):
+    event_handler = EventHandler()
+    with client.beta.threads.runs.stream(
+            thread_id=thread_id,
+            assistant_id=assistant_id,
+            event_handler=event_handler,
+    ) as stream:
+        stream.until_done()
+    return event_handler.response_text
+
+
+# Main Loop to Continuously Listen, Transcribe, Interact with Assistant, and Scrape Web if Needed
+def main():
+    thread = client.beta.threads.create()
+    print("Speak Now")
+
+    try:
+        while True:
+            transcription = transcribe_audio()  # Record and transcribe user speech
+            print(f"Transcription: {transcription}")
+
+            # Send transcription to assistant and retrieve response
+            send_message_to_assistant(client, thread.id, transcription)
+            assistant_response = run_assistant(client, thread.id)
+
+            # Web-surfing fallback: If assistant indicates uncertainty, perform a search and general summary
+            if "I'm not sure" in assistant_response or "I don't have that information" in assistant_response:
+                web_info = search_and_summarize(transcription)
+                assistant_response = f"{web_info}"
+
+            # Convert assistant's response to audio and play
+            text_to_audio(assistant_response)
+    except KeyboardInterrupt:
+        print("Stopping...")
+    finally:
+        # Clean up audio stream resources
+        stream.stop_stream()
+        stream.close()
+        p.terminate()
+        print("Audio stream closed.")
+
+
+if __name__ == "__main__":
+    main()
